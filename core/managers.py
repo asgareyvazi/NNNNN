@@ -81,9 +81,17 @@ class StatusBarManager(QObject):
         self.show_message_signal.emit(widget_name, f"❌ {message}", 5000)
 
     def register_widget(self, widget_name: str, widget: QWidget):
-        if widget_name not in self._widgets:
-            self._widgets[widget_name] = widget
-            logger.debug(f"📝 Registered widget: {widget_name}")
+        self._widgets[widget_name] = widget
+        # QObject.destroyed is the reliable lifecycle hook; it also prevents
+        # stale widgets from being retained by the process-wide manager.
+        try:
+            widget.destroyed.connect(lambda *_: self.unregister_widget(widget_name))
+        except (AttributeError, RuntimeError):
+            pass
+        logger.debug(f"📝 Registered widget: {widget_name}")
+
+    def unregister_widget(self, widget_name: str):
+        self._widgets.pop(widget_name, None)
 
     def register_main_window(self, main_window: QMainWindow):
         self.register_widget("MainWindow", main_window)
@@ -615,21 +623,45 @@ class ExportManager:
             return None
 
     def _export_to_pdf(self, table_widget, filename=None):
+        """Export the complete table, not just a title.
+
+        QTextDocument is part of Qt and therefore avoids an optional
+        reportlab dependency.  Long tables naturally paginate when printed.
+        """
         try:
-            from reportlab.lib.pagesizes import A4
-            from reportlab.pdfgen import canvas as pdf_canvas
+            from html import escape
+            from PySide6.QtGui import QTextDocument
+            from PySide6.QtPrintSupport import QPrinter
             if not filename:
                 filename = f"export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
-            c = pdf_canvas.Canvas(filename, pagesize=A4)
-            c.setFont("Helvetica-Bold", 16)
-            c.drawString(50, A4[1] - 50, "Table Export")
-            c.save()
+            headers = []
+            for col in range(table_widget.columnCount()):
+                item = table_widget.horizontalHeaderItem(col)
+                headers.append(escape(item.text() if item else f"Column {col + 1}"))
+            rows = []
+            for row in range(table_widget.rowCount()):
+                cells = []
+                for col in range(table_widget.columnCount()):
+                    item = table_widget.item(row, col)
+                    cells.append(escape(item.text() if item else ""))
+                rows.append("<tr>" + "".join(f"<td>{cell}</td>" for cell in cells) + "</tr>")
+            html = """<!doctype html><html><head><meta charset='utf-8'>
+            <style>@page{margin:12mm}body{font-family:Arial;font-size:8pt}
+            h1{font-size:14pt;color:#2c3e50}table{width:100%;border-collapse:collapse}
+            th,td{border:1px solid #bfc5ca;padding:4px;word-wrap:break-word}
+            th{background:#2c3e50;color:white}tr:nth-child(even){background:#f4f6f7}
+            </style></head><body><h1>Table Export</h1><table><thead><tr>"""
+            html += "".join(f"<th>{header}</th>" for header in headers)
+            html += "</tr></thead><tbody>" + "".join(rows) + "</tbody></table></body></html>"
+            printer = QPrinter(QPrinter.HighResolution)
+            printer.setOutputFormat(QPrinter.PdfFormat)
+            printer.setOutputFileName(filename)
+            doc = QTextDocument()
+            doc.setHtml(html)
+            doc.print_(printer)
             return filename
-        except ImportError:
-            logger.error("PDF export requires 'reportlab' package")
-            return None
         except Exception as e:
-            logger.error(f"PDF export failed: {e}")
+            logger.error(f"PDF export failed: {e}", exc_info=True)
             return None
 
     def _export_to_excel(self, table_widget, filename=None):
@@ -657,6 +689,51 @@ class ExportManager:
         except Exception as e:
             logger.error(f"Excel export failed: {e}")
             return None
+
+    def export_rows(self, rows, headers, filename, format="csv", title="Export"):
+        """Export database/query rows consistently across all tabs.
+
+        ``rows`` may contain dictionaries or sequences.  This is the common
+        path for report, analysis and import-preview exports, so tabs no
+        longer need slightly different CSV implementations.
+        """
+        if not filename or not headers:
+            return None
+        try:
+            normalized = []
+            for row in rows or []:
+                if isinstance(row, dict):
+                    normalized.append([row.get(header, "") for header in headers])
+                else:
+                    normalized.append(list(row))
+            if format.lower() == "csv":
+                with open(filename, "w", newline="", encoding="utf-8-sig") as stream:
+                    writer = csv.writer(stream)
+                    writer.writerow(headers)
+                    writer.writerows(normalized)
+                return filename
+            if format.lower() == "excel":
+                from openpyxl import Workbook
+                wb = Workbook()
+                ws = wb.active
+                ws.title = title[:31] or "Export"
+                ws.append(list(headers))
+                for row in normalized:
+                    ws.append(row)
+                ws.freeze_panes = "A2"
+                ws.auto_filter.ref = ws.dimensions
+                wb.save(filename)
+                return filename
+            if format.lower() == "html":
+                from html import escape
+                head = "".join(f"<th>{escape(str(h))}</th>" for h in headers)
+                body = "".join("<tr>" + "".join(f"<td>{escape(str(v or ''))}</td>" for v in row) + "</tr>" for row in normalized)
+                with open(filename, "w", encoding="utf-8") as stream:
+                    stream.write(f"<html><head><meta charset='utf-8'><title>{escape(title)}</title></head><body><h1>{escape(title)}</h1><table border='1'><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table></body></html>")
+                return filename
+        except Exception as e:
+            logger.error("Row export failed: %s", e, exc_info=True)
+        return None
 
     def export_image(self, pixmap_or_widget, filename=None):
         if not filename:
@@ -709,15 +786,13 @@ class DrillingManager:
         return round(bit_drilled / hours_on_bottom, 2)
     
     @staticmethod
-    def calculate_hsi(pump_pressure: float, flow_rate: float, tfa: float) -> float:
-        if tfa <= 0:
+    def calculate_hsi(pump_pressure: float, flow_rate: float, bit_size: float) -> float:
+        """Hydraulic horsepower per square inch of bit area."""
+        if bit_size <= 0 or pump_pressure < 0 or flow_rate < 0:
             return 0.0
-        # HSI = (Q × ΔP) / (1714 × bit_area)
-        # اینجا ساده‌شده: HSI = HHP / bit_area
-        hhp = pump_pressure * flow_rate / 1714
-        # تقریب: bit_area ≈ TFA × 20 (factor)
-        hsi = hhp / (tfa * 1714) if tfa > 0 else 0
-        return round(hsi, 2)
+        hhp = pump_pressure * flow_rate / 1714.0
+        bit_area = 3.141592653589793 * (bit_size ** 2) / 4.0
+        return round(hhp / bit_area, 2)
 
     @staticmethod
     def calculate_annular_velocity(

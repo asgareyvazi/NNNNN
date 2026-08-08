@@ -26,6 +26,7 @@ from PySide6.QtCore import Signal, Qt, QTimer
 from PySide6.QtGui import QColor
 
 from core.text_utils import wrap_text
+from core.import_quality import ImportValidator, find_duplicates
 from dialogs.smart_template_dialog import (
     SmartTemplateDialog, ValueNormalizer, FIELD_LABELS,
 )
@@ -84,6 +85,11 @@ class ExcelImportDialog(QDialog):
         )
         smart_btn.clicked.connect(self._smart_import)
         sl.addWidget(smart_btn)
+
+        profile_btn = QPushButton("🏢 OEOC Profile Import (fast)")
+        profile_btn.setToolTip("Use the strict DDR Remark / DDR Data profile, then run the same validation and save pipeline")
+        profile_btn.clicked.connect(self._profile_import)
+        sl.addWidget(profile_btn)
         layout.addWidget(smart_group)
 
         # ===== Batch Import =====
@@ -211,6 +217,35 @@ class ExcelImportDialog(QDialog):
         results = self._do_import(extracted, refresh_ui=False)
         self.import_completed.emit([results])
         self.accept()
+
+    def _profile_import(self):
+        """Run the strict profile engine through the common import pipeline.
+
+        Previously ProfileImportEngine was dead code: the UI only opened
+        SmartTemplateDialog. Keeping its extraction but sharing _do_import
+        guarantees identical validation, duplicate handling and refresh.
+        """
+        filepath, _ = QFileDialog.getOpenFileName(
+            self, "Select OEOC DDR Excel", "", "Excel Files (*.xlsx *.xls)"
+        )
+        if not filepath:
+            return
+        try:
+            from core.profile_import_engine import ProfileImportEngine
+            extracted = ProfileImportEngine(self.db).analyze_and_extract(filepath)
+            results = self._do_import(extracted, refresh_ui=False)
+            self.import_completed.emit([results])
+            self.accept()
+        except ImportError as exc:
+            QMessageBox.warning(self, "Missing Excel dependency", f"Install openpyxl first:\n{exc}")
+        except ValueError as exc:
+            # A custom workbook is not a profile failure; guide the user to
+            # Smart Import instead of emitting an alarming traceback.
+            logger.info("Profile not applicable: %s", exc)
+            QMessageBox.information(self, "Use Smart Import", str(exc))
+        except Exception as exc:
+            logger.error("Profile import failed: %s", exc, exc_info=True)
+            QMessageBox.critical(self, "Profile Import Failed", str(exc))
 
     # ================================================================
     # Template Import
@@ -528,11 +563,39 @@ class ExcelImportDialog(QDialog):
             "details": [],
             "report_id": None,
             "section_id": None,
+            "import_report": None,
         }
         session = None
 
         try:
             from core.database import Section, DailyReport
+
+            # Validate before touching the database.  A bad optional row is
+            # reported and skipped; a bad base report stops this import.
+            report_data = extracted.get("daily_report", {})
+            quality = ImportValidator.validate_rows(
+                [report_data], "daily_report", "Daily Report"
+            )
+            time_logs = extracted.get("time_logs_24h", []) or []
+            log_quality = ImportValidator.validate_rows(
+                time_logs, "time_log", "Time Logs 24H"
+            )
+            duplicate_indexes = set(find_duplicates(time_logs, "time_log"))
+            for index in sorted(duplicate_indexes, reverse=True):
+                del time_logs[index]
+                log_quality.skipped += 1
+            quality.total += log_quality.total
+            quality.failed += log_quality.failed
+            quality.issues.extend(log_quality.issues)
+            results["import_report"] = quality.as_dict()
+            if quality.errors and not report_data.get("report_date"):
+                results["failed"] += 1
+                results["details"].append("❌ Import stopped: invalid Daily Report")
+                return results
+            if duplicate_indexes:
+                results["details"].append(
+                    f"⚠️ Skipped {len(duplicate_indexes)} duplicate time-log rows"
+                )
 
             # ===== 1. Well Info =====
             wi = extracted.get("well_info", {})
@@ -693,7 +756,9 @@ class ExcelImportDialog(QDialog):
                     self.well_id, report_id, extracted
                 )
                 for k, count in multi_res.items():
-                    if count > 0:
+                    if k == "failed":
+                        results["failed"] += int(count or 0)
+                    elif count > 0:
                         results["details"].append(f"✅ {k}: {count} records imported")
                         
             return results

@@ -1472,11 +1472,36 @@ class CodeResolver:
     """Resolve main codes and sub codes to full names"""
 
     @staticmethod
+    def _clean_code(value):
+        """Normalize Excel numeric/text codes without losing decimals."""
+        if value is None:
+            return ""
+        text = str(value).strip().replace("–", "-").replace("—", "-")
+        # Excel commonly turns integer codes into 2.0; only remove a
+        # trailing numeric .0, never a meaningful composite such as 2.1.
+        text = re.sub(r"(?<=\d)\.0+(?=\s*$)", "", text)
+        return text
+
+    @staticmethod
+    def _main_number(value):
+        text = CodeResolver._clean_code(value)
+        # Accept 2.1, 2-Drilling, 2 / Drilling and "2 - Drilling".
+        match = re.search(r"^\s*(\d+)", text)
+        return match.group(1) if match else ""
+
+    @staticmethod
+    def _composite_number(value):
+        text = CodeResolver._clean_code(value)
+        match = re.search(r"^\s*(\d+)\s*[./-]\s*(\d+)", text)
+        return f"{match.group(1)}.{match.group(2)}" if match else ""
+
+    @staticmethod
     def resolve_main_code(raw_code) -> str:
         if raw_code is None:
             return ""
-        code_str = str(raw_code).strip()
-        clean = code_str.replace(".0", "").strip()
+        code_str = CodeResolver._clean_code(raw_code)
+        composite = CodeResolver._composite_number(code_str)
+        clean = CodeResolver._main_number(composite or code_str)
 
         # already has name
         if " - " in code_str and len(code_str) > 5:
@@ -1514,10 +1539,17 @@ class CodeResolver:
 
     @staticmethod
     def resolve_sub_code(raw_sub, raw_main="") -> str:
-        if raw_sub is None:
+        # A surprising number of DDR sheets put the composite code (2.3) in
+        # either the main or sub column. Prefer the explicit composite.
+        composite_from_sub = CodeResolver._composite_number(raw_sub)
+        composite_from_main = CodeResolver._composite_number(raw_main)
+        composite = composite_from_sub or composite_from_main
+        if composite and composite in SUB_CODE_MAP:
+            return f"{composite} - {SUB_CODE_MAP[composite]}"
+        if raw_sub is None or str(raw_sub).strip() == "":
             return ""
-        sub_str = str(raw_sub).strip()
-        clean_sub = sub_str.replace(".0", "").strip()
+        sub_str = CodeResolver._clean_code(raw_sub)
+        clean_sub = sub_str
 
         # already has name
         if len(sub_str) > 8 and any(
@@ -1850,6 +1882,10 @@ class SmartTemplateDialog(QDialog):
         )
         self.summary_label.setFixedHeight(22)
         left_layout.addWidget(self.summary_label)
+        self.code_detection_label = QLabel("🏷️ Activity codes: not scanned")
+        self.code_detection_label.setStyleSheet("font-size: 10px; color: #666; padding: 3px;")
+        self.code_detection_label.setWordWrap(True)
+        left_layout.addWidget(self.code_detection_label)
 
         fl = QHBoxLayout()
         fl.addWidget(QLabel("Filter:"))
@@ -2449,8 +2485,8 @@ class SmartTemplateDialog(QDialog):
         ):
             if r in checked_rows:
                 continue
-            txt = str(val).lower().strip()
-            if txt not in ("from", "from:"):
+            txt = re.sub(r"[^a-z0-9]", "", str(val).lower())
+            if txt not in ("from", "timefrom", "starttime", "timein"):
                 continue
 
             row_texts = {}
@@ -2458,12 +2494,11 @@ class SmartTemplateDialog(QDialog):
                 if r2 == r:
                     row_texts[c2] = str(v2).lower().strip()
 
-            has_to = any(
-                t in ("to", "to:") for t in row_texts.values()
-            )
+            normalized_headers = [re.sub(r"[^a-z0-9]", "", t) for t in row_texts.values()]
+            has_to = any(t in ("to", "timeto", "endtime", "timeout") for t in normalized_headers)
             has_hrs = any(
-                any(w in t for w in ["hrs", "duration", "hour"])
-                for t in row_texts.values()
+                any(w in t for w in ["hrs", "hour", "duration"])
+                for t in normalized_headers
             )
 
             if has_to and has_hrs:
@@ -2498,21 +2533,29 @@ class SmartTemplateDialog(QDialog):
     ) -> Dict[str, int]:
         col_map = {}
         for c2, txt2 in sorted(row_texts.items()):
-            if txt2 in ("from", "from:"):
+            normalized = re.sub(r"[^a-z0-9]", "", txt2)
+            if normalized in ("from", "timefrom", "starttime", "timein"):
                 col_map["from"] = c2
-            elif txt2 in ("to", "to:"):
+            elif normalized in ("to", "timeto", "endtime", "timeout"):
                 col_map["to"] = c2
             elif any(
-                w in txt2 for w in ["hrs", "duration", "hour"]
+                w in normalized for w in ["hrs", "duration", "hour"]
             ):
                 col_map["hrs"] = c2
             elif any(
                 w in txt2 for w in ["main phase", "phase"]
             ):
                 col_map["phase"] = c2
-            elif txt2 == "code" or "main code" in txt2:
+            elif (
+                normalized in ("code", "maincode", "activitycode", "phasecode", "mainactivitycode", "mainactivity")
+                or "maincode" in normalized
+                or "activitycode" in normalized
+            ):
                 col_map["code"] = c2
-            elif "sub" in txt2 and "code" in txt2:
+            elif (
+                ("sub" in txt2 or "secondary" in txt2)
+                and "code" in txt2
+            ):
                 col_map["sub_code"] = c2
             elif txt2 == "status":
                 col_map["status"] = c2
@@ -2577,18 +2620,27 @@ class SmartTemplateDialog(QDialog):
 
             hrs = ValueNormalizer.to_float(hrs_raw) or 0.0
 
-            # Main code - full resolution
+            # Main/sub code.  Some DDR exports leave the dedicated code
+            # cells empty and put 2.3 in the phase or description column.
             raw_code = row_cells.get(col_map.get("code", 0))
-            main_code = CodeResolver.resolve_main_code(raw_code)
-
-            # Sub code - full resolution
             raw_sub = row_cells.get(col_map.get("sub_code", 0))
-            sub_code = CodeResolver.resolve_sub_code(
-                raw_sub, raw_code
-            )
-
-            # Phase
             raw_phase = row_cells.get(col_map.get("phase", 0))
+            raw_desc_for_code = row_cells.get(col_map.get("desc", 0))
+            code_source = " ".join(str(v or "") for v in (raw_code, raw_sub, raw_phase, raw_desc_for_code))
+            composite_match = re.search(r"(?<!\d)(\d{1,2})\s*[./-]\s*(\d{1,2})(?!\d)", code_source)
+            if composite_match:
+                composite = f"{composite_match.group(1)}.{composite_match.group(2)}"
+                if not raw_code or not str(raw_code).strip():
+                    raw_code = composite
+                if not raw_sub or not str(raw_sub).strip():
+                    raw_sub = composite
+
+            if not raw_code or not str(raw_code).strip():
+                # Phase names such as "DRL - Drilling" are a valid main-code
+                # fallback when the workbook has no Main Code column.
+                raw_code = raw_phase
+            main_code = CodeResolver.resolve_main_code(raw_code)
+            sub_code = CodeResolver.resolve_sub_code(raw_sub, raw_code)
             main_phase = str(raw_phase).strip() if raw_phase else ""
 
             # NPT
@@ -2749,6 +2801,20 @@ class SmartTemplateDialog(QDialog):
             f"🟢 {high} high | "
             f"🔴 {missing} missing | "
             f"📋 Logs: {tl_24}+{tl_m}"
+        )
+        logs = self.base_extracted.get("time_logs_24h", []) + self.base_extracted.get("time_logs_morning", [])
+        with_main = sum(bool(log.get("main_code")) for log in logs)
+        with_sub = sum(bool(log.get("sub_code")) for log in logs)
+        examples = []
+        for log in logs:
+            if log.get("main_code") or log.get("sub_code"):
+                examples.append(f"{log.get('main_code', '')} / {log.get('sub_code', '')}")
+            if len(examples) == 3:
+                break
+        detail = "; ".join(examples)
+        self.code_detection_label.setText(
+            f"🏷️ Activity codes: Main {with_main}/{len(logs)}, "
+            f"Sub {with_sub}/{len(logs)}" + (f" — {detail}" if detail else " — no code columns detected")
         )
         self.import_btn.setEnabled(detected > 0)
 

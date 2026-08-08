@@ -100,18 +100,27 @@ class ProfileImportEngine:
         wb = load_workbook(filepath, data_only=True)
         sheet_names = [s.title for s in wb.worksheets]
         
-        # 1. پیدا کردن پروفایل
+        # 1. پیدا کردن پروفایل.  Real-world workbooks often rename sheets
+        # (for example DDR_Remark, DDR-Data, or add a company prefix), so an
+        # exact two-sheet match was too strict and made this engine appear
+        # unusable.
         matched_profile = None
+        best_score = 0
         for profile in self.profiles:
-            match_count = sum(1 for identifier in profile["sheet_identifiers"] if any(identifier.lower() in s.lower() for s in sheet_names))
-            if match_count == len(profile["sheet_identifiers"]):
-                matched_profile = profile
-                break
-                
-        if not matched_profile:
-            raise Exception("No matching profile found for this Excel format. (Only OEOC is supported currently)")
-            
-        logger.info(f"Matched Profile: {matched_profile['name']}")
+            score = sum(
+                1 for identifier in profile["sheet_identifiers"]
+                if any(identifier.lower().replace(" ", "") in s.lower().replace(" ", "") for s in sheet_names)
+            )
+            if score > best_score:
+                best_score, matched_profile = score, profile
+
+        if not matched_profile or best_score == 0:
+            raise ValueError(
+                "No supported DDR profile detected. Expected a sheet containing "
+                "DDR Remark/DDR Data, or use Smart Import for a custom workbook."
+            )
+
+        logger.info(f"Matched Profile: {matched_profile['name']} (score {best_score}/{len(matched_profile['sheet_identifiers'])})")
         
         SKIP_SHEETS = [
             "setting", "config", "template", "pivot",
@@ -169,16 +178,22 @@ class ProfileImportEngine:
                 extracted_data[section][key] = val
 
         # 5. استخراج متن‌های طولانی (Summary)
+        remark_sheet = self._get_real_sheet_name(sheet_names, "DDR Remark")
+        data_sheet = self._get_real_sheet_name(sheet_names, "DDR Data")
+        if not remark_sheet:
+            # Some vendors put the time table in a renamed operations sheet.
+            remark_sheet = next((s for s in sheet_names if "remark" in s.lower() or "operation" in s.lower()), None)
         extracted_data["daily_report"]["summary"] = self._extract_text_block(
-            "DDR Remark", "Summary of Activities in Last 24", "Operation Forecast"
-        )
+            remark_sheet, "Summary of Activities in Last 24", "Operation Forecast"
+        ) if remark_sheet else ""
         extracted_data["daily_report"]["forecast"] = self._extract_text_block(
-            "DDR Remark", "Operation Forecast for next", "From"
-        )
+            remark_sheet, "Operation Forecast for next", "From"
+        ) if remark_sheet else ""
 
         # 6. استخراج جداول (Time Log و Service Company)
-        extracted_data["time_logs_24h"] = self._extract_time_logs("DDR Remark")
-        extracted_data["service_companies"] = self._extract_service_companies("Service Company")
+        extracted_data["time_logs_24h"] = self._extract_time_logs(remark_sheet) if remark_sheet else []
+        service_sheet = self._get_real_sheet_name(sheet_names, "Service Company")
+        extracted_data["service_companies"] = self._extract_service_companies(service_sheet) if service_sheet else []
 
         # 7. استخراج خودکار داده‌ها برای سایر تب‌ها (Trajectory, Logistics POB/Bulk, Casing/Cement, Bit/BHA, HSE, Cost)
         multi_data = self._extract_multi_tab_sheets(sheet_names)
@@ -200,7 +215,8 @@ class ProfileImportEngine:
             "safety_report": {},
             "bop_components": [],
             "waste_records": [],
-            "cost_records": []
+            "cost_records": [],
+            "equipment_logs": []
         }
         for name in sheet_names:
             lower_name = name.lower()
@@ -270,7 +286,28 @@ class ProfileImportEngine:
                             "current_stock": stock + (self._to_float(cache[r].get(5)) or 0.0) - (self._to_float(cache[r].get(6)) or 0.0)
                         })
 
-            # F. Safety / BOP
+            # F. Equipment and solid-control logs
+            elif any(k in lower_name for k in ["equipment", "drill pipe", "solid control", "solids"]):
+                for r in range(2, 200):
+                    if r not in cache:
+                        continue
+                    row = cache[r]
+                    equipment_name = row.get(1) or row.get(2)
+                    if not equipment_name:
+                        continue
+                    equipment_type = "Solid Control" if any(k in lower_name for k in ["solid", "solids"]) else ("Drill Pipe" if "pipe" in lower_name else "Rig Equipment")
+                    res["equipment_logs"].append({
+                        "equipment_type": equipment_type,
+                        "equipment_name": str(equipment_name),
+                        "equipment_id": str(row.get(2) or ""),
+                        "manufacturer": str(row.get(3) or ""),
+                        "serial_number": str(row.get(4) or ""),
+                        "status": str(row.get(5) or "Operational"),
+                        "notes": str(row.get(6) or ""),
+                        "hours_worked": self._to_float(row.get(7)) or 0.0,
+                    })
+
+            # G. Safety / BOP
             elif any(k in lower_name for k in ["safety", "bop", "hse", "waste"]):
                 res["safety_report"] = {
                     "days_without_lti": int(self._to_float(cache.get(2, {}).get(2, 0)) or 0),
@@ -302,8 +339,13 @@ class ProfileImportEngine:
     # ------------------- توابع کمکی جادویی -------------------
 
     def _get_real_sheet_name(self, actual_names, partial_name):
-        for name in actual_names:
-            if partial_name.lower() in name.lower():
+        """Resolve a profile sheet name without leaving legacy code paths."""
+        wanted = re.sub(r"[^a-z0-9]", "", str(partial_name).lower())
+        if not wanted:
+            return None
+        for name in actual_names or []:
+            candidate = re.sub(r"[^a-z0-9]", "", str(name).lower())
+            if wanted in candidate or candidate in wanted:
                 return name
         return None
 
@@ -422,8 +464,8 @@ class ProfileImportEngine:
             elif v_lower == "to": c_to = c
             elif "hrs" in v_lower: c_hrs = c
             elif "main phase" in v_lower: c_phase = c
-            elif v_lower == "code": c_code = c
-            elif "sub code" in v_lower: c_sub = c
+            elif v_lower in ("code", "main code", "activity code", "phase code") or "main code" in v_lower or "activity code" in v_lower: c_code = c
+            elif ("sub" in v_lower or "secondary" in v_lower) and "code" in v_lower: c_sub = c
             elif v_lower == "status": c_status = c
             elif "npt" in v_lower: c_npt = c
             elif "rig activity" in v_lower: c_act = c
@@ -454,13 +496,36 @@ class ProfileImportEngine:
             npt_val = str(cache[r].get(c_npt, "")).strip()
             is_npt = bool(npt_val and npt_val not in ("-", "---", "None"))
             
+            raw_main = cache[r].get(c_code)
+            raw_sub = cache[r].get(c_sub)
+            # Fallback for exports that place the composite code in phase or
+            # activity text instead of a dedicated code column.
+            raw_phase = cache[r].get(c_phase)
+            raw_activity = cache[r].get(c_act)
+            source = " ".join(str(v or "") for v in (raw_main, raw_sub, raw_phase, raw_activity))
+            composite_match = re.search(r"(?<!\d)(\d{1,2})\s*[./-]\s*(\d{1,2})(?!\d)", source)
+            if composite_match:
+                composite = f"{composite_match.group(1)}.{composite_match.group(2)}"
+                raw_main = raw_main or composite
+                raw_sub = raw_sub or composite
+            if not raw_main or not str(raw_main).strip():
+                raw_main = raw_phase
+            try:
+                # Keep one canonical resolver for Smart and profile imports.
+                from dialogs.smart_template_dialog import CodeResolver
+                normalized_main = CodeResolver.resolve_main_code(raw_main)
+                normalized_sub = CodeResolver.resolve_sub_code(raw_sub, raw_main)
+            except Exception:
+                normalized_main = str(raw_main or "").strip()
+                normalized_sub = str(raw_sub or "").strip()
+
             logs.append({
                 "time_from": tf,
                 "time_to": tt,
                 "duration": hrs,
                 "main_phase": str(cache[r].get(c_phase, "")),
-                "main_code": str(cache[r].get(c_code, "")),
-                "sub_code": str(cache[r].get(c_sub, "")),
+                "main_code": normalized_main,
+                "sub_code": normalized_sub,
                 "status": str(cache[r].get(c_status, "PLN")),
                 "is_npt": is_npt,
                 "npt_category": npt_val if is_npt else "",

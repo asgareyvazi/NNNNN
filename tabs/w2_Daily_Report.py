@@ -850,15 +850,13 @@ class DailyReportWidget(DrillTabBase):
         is_npt = False
         if log_data and hasattr(log_data, 'is_npt'):
             is_npt = log_data.is_npt
+        stored_main_code = ""
         if log_data and hasattr(log_data, 'main_code'):
-            if is_npt:
-                idx = npt_code_combo.findText(log_data.main_code)
-                if idx >= 0:
-                    npt_code_combo.setCurrentIndex(idx)
-            else:
-                idx = normal_code_combo.findText(log_data.main_code)
-                if idx >= 0:
-                    normal_code_combo.setCurrentIndex(idx)
+            stored_main_code = str(log_data.main_code or "")
+            target_combo = npt_code_combo if is_npt else normal_code_combo
+            idx = self._find_code_index(target_combo, stored_main_code)
+            if idx >= 0:
+                target_combo.setCurrentIndex(idx)
 
         stacked.addWidget(normal_code_combo)
         stacked.addWidget(npt_code_combo)
@@ -871,6 +869,8 @@ class DailyReportWidget(DrillTabBase):
             self._update_sub_codes_for_npt(sub_code_combo, npt_code_combo.currentText())
         else:
             self._update_sub_codes_normal(sub_code_combo, normal_code_combo.currentText())
+        if log_data and hasattr(log_data, 'sub_code'):
+            self._select_code_value(sub_code_combo, str(log_data.sub_code or ""))
         table.setCellWidget(row, 5, sub_code_combo)
 
         # اتصالات
@@ -1004,6 +1004,33 @@ class DailyReportWidget(DrillTabBase):
             combo.addItem(text)
             self.status_manager.show_message("DailyReport", f"New contractor '{text}' added", 2000)
             
+    @staticmethod
+    def _code_variants(value):
+        text = str(value or "").strip()
+        # Stored imports may be "2 - Drilling" while UI uses "Drilling".
+        variants = [text]
+        if " - " in text:
+            variants.append(text.split(" - ", 1)[1].strip())
+        return [v.lower().strip() for v in variants if v]
+
+    def _find_code_index(self, combo, stored_value):
+        wanted = self._code_variants(stored_value)
+        for index in range(combo.count()):
+            candidate = self._code_variants(combo.itemText(index))
+            if any(a == b or a in b or b in a for a in wanted for b in candidate):
+                return index
+        return -1
+
+    def _select_code_value(self, combo, stored_value):
+        index = self._find_code_index(combo, stored_value)
+        if index >= 0:
+            combo.setCurrentIndex(index)
+        elif stored_value:
+            # Preserve an imported code not present in the local catalogue;
+            # silently replacing it with the first item is data corruption.
+            combo.setEditable(True)
+            combo.setCurrentText(str(stored_value))
+
     def _update_sub_codes_normal(self, sub_combo, main_code):
         """به‌روزرسانی زیرکدها برای فعالیت عادی"""
         sub_combo.clear()
@@ -1794,7 +1821,7 @@ class DailyReportWidget(DrillTabBase):
         return None
 
     def validate_tab_ownership(self):
-       """اعتبارسنجی مالکیت تب‌ها با دیلی ریپورت جاری."""
+        """اعتبارسنجی مالکیت تب‌ها با دیلی ریپورت جاری."""
         if self.current_report and self.current_well:
             rep_well_id = self.current_report.get('well_id')
             curr_well_id = self.current_well.get('id') if isinstance(self.current_well, dict) else getattr(self.current_well, 'id', None)
@@ -1998,6 +2025,57 @@ class DailyReportWidget(DrillTabBase):
             self.status_manager.show_message("DailyReportWidget", "No well selected", 2000)
             return False
         return self.save_report()
+
+    def submit_report(self):
+        if not self.current_report_id:
+            self.show_warning("Select a report first")
+            return False
+        try:
+            ok = self.db_manager.set_report_status(self.current_report_id, "Submitted")
+            if ok:
+                self.db_manager.create_report_revision(self.current_report_id, "Submitted")
+                self.load_report_by_id(self.current_report_id)
+                self.show_success("Report submitted for review")
+            return bool(ok)
+        except Exception as exc:
+            logger.error("Submit report failed: %s", exc, exc_info=True)
+            self.show_error(str(exc))
+            return False
+
+    def approve_report(self, comment=""):
+        if not self.current_report_id:
+            self.show_warning("Select a report first")
+            return False
+        try:
+            ok = self.db_manager.set_report_status(self.current_report_id, "Approved", comment=comment)
+            if ok:
+                self.db_manager.create_report_revision(self.current_report_id, "Approved", comment)
+                self.load_report_by_id(self.current_report_id)
+                self.show_success("Report approved")
+            return bool(ok)
+        except Exception as exc:
+            logger.error("Approve report failed: %s", exc, exc_info=True)
+            self.show_error(str(exc))
+            return False
+
+    def reject_report(self, comment=""):
+        if not self.current_report_id:
+            self.show_warning("Select a report first")
+            return False
+        if not comment.strip():
+            self.show_warning("A rejection comment is required")
+            return False
+        try:
+            ok = self.db_manager.set_report_status(self.current_report_id, "Rejected", comment=comment)
+            if ok:
+                self.db_manager.create_report_revision(self.current_report_id, "Rejected", comment)
+                self.load_report_by_id(self.current_report_id)
+                self.show_warning("Report rejected")
+            return bool(ok)
+        except Exception as exc:
+            logger.error("Reject report failed: %s", exc, exc_info=True)
+            self.show_error(str(exc))
+            return False
 
     def refresh(self):
         if self.current_report_id:
